@@ -1,15 +1,29 @@
-import { useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { addRecipe, getRecipeById, getRootRecipe } from "../data/recipesStore";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+
+import {
+  addRecipe,
+  fetchRecipeById,
+  getRecipeById,
+  getRootRecipe,
+} from "../data/recipesStore";
 import { forkRecipe } from "../utils/fork";
+import { useAuth } from "../auth/useAuth";
+import {
+  listenIsRecipeSaved,
+  saveRecipeToBook,
+  unsaveRecipeFromBook,
+} from "../data/savedRecipesStore";
+import type { Recipe } from "../data/sampleRecipes";
 
 type ForkChoice = "branch" | "original";
 
 export default function RecipeDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const { user, loading: authLoading } = useAuth();
 
-  // ✅ Hooks must be unconditional
   const [forkOpen, setForkOpen] = useState(false);
   const [forkChoice, setForkChoice] = useState<ForkChoice>("branch");
   const [forkReason, setForkReason] = useState(
@@ -17,42 +31,159 @@ export default function RecipeDetail() {
   );
   const [isForking, setIsForking] = useState(false);
 
-  const recipe = id ? getRecipeById(id) : undefined;
+  const [recipe, setRecipe] = useState<Recipe | undefined>(undefined);
+  const [rootRecipe, setRootRecipe] = useState<Recipe | undefined>(undefined);
+  const [loadingRecipe, setLoadingRecipe] = useState(true);
 
-  // ✅ safe derivations without calling helpers on undefined
-  const rootRecipe = recipe ? getRootRecipe(recipe) : undefined;
+  const [isSaved, setIsSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+
   const isFork = Boolean(recipe?.parentId);
   const canOfferOriginalChoice = Boolean(isFork && rootRecipe);
 
+  function goToLogin() {
+    navigate("/login", { state: { from: location.pathname } });
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      if (!id) {
+        setRecipe(undefined);
+        setRootRecipe(undefined);
+        setLoadingRecipe(false);
+        return;
+      }
+
+      setLoadingRecipe(true);
+      try {
+        // 1) try cache first
+        let r = getRecipeById(id);
+
+        // 2) if missing, fetch
+        if (!r) {
+          const fetched = await fetchRecipeById(id);
+          r = fetched ?? undefined;
+        }
+
+        if (cancelled) return;
+        setRecipe(r);
+
+        // root recipe
+        if (r) {
+          const rootId = r.rootId ?? r.id;
+          let root = getRecipeById(rootId) ?? getRootRecipe(r);
+
+          if (!root && rootId) {
+            const fetchedRoot = await fetchRecipeById(rootId);
+            root = fetchedRoot ?? undefined;
+          }
+
+          if (cancelled) return;
+          setRootRecipe(root);
+        } else {
+          setRootRecipe(undefined);
+        }
+      } finally {
+        if (!cancelled) setLoadingRecipe(false);
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  useEffect(() => {
+    if (!user || !recipe?.id) {
+      setIsSaved(false);
+      return;
+    }
+    return listenIsRecipeSaved(user.uid, recipe.id, setIsSaved);
+  }, [user, recipe?.id]);
+
+  const servingsLabel = useMemo(() => {
+    if (!recipe) return "";
+    return `${recipe.visibility.toUpperCase()} • ${
+      recipe.servingsDefault
+    } servings`;
+  }, [recipe]);
+
   function openFork() {
+    if (!user && !authLoading) {
+      goToLogin();
+      return;
+    }
     setForkChoice("branch");
     setForkOpen(true);
   }
 
-  function createFork() {
+  async function toggleSave() {
     if (!recipe) return;
-    if (isForking) return;
+    if (!user && !authLoading) {
+      goToLogin();
+      return;
+    }
+    if (!user) return;
 
+    if (saving) return;
+    setSaving(true);
+
+    try {
+      if (isSaved) await unsaveRecipeFromBook(user.uid, recipe.id);
+      else await saveRecipeToBook(user.uid, recipe.id);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createFork() {
+    if (!recipe) return;
+
+    if (!user && !authLoading) {
+      setForkOpen(false);
+      goToLogin();
+      return;
+    }
+    if (!user) return;
+
+    if (isForking) return;
     setIsForking(true);
 
-    const fork =
-      forkChoice === "original" && rootRecipe
-        ? forkRecipe(recipe, {
-            choice: "original",
-            original: rootRecipe,
-            overrides: { forkReason },
-          })
-        : forkRecipe(recipe, {
-            choice: "branch",
-            overrides: { forkReason },
-          });
+    try {
+      const fork =
+        forkChoice === "original" && rootRecipe
+          ? forkRecipe(recipe, {
+              choice: "original",
+              original: rootRecipe,
+              overrides: { forkReason },
+            })
+          : forkRecipe(recipe, {
+              choice: "branch",
+              overrides: { forkReason },
+            });
 
-    addRecipe(fork);
+      const newId = await addRecipe(fork);
 
-    setForkOpen(false);
-    setIsForking(false);
+      // forks auto-save
+      await saveRecipeToBook(user.uid, newId);
 
-    navigate(`/recipes/${fork.id}`);
+      setForkOpen(false);
+      navigate(`/recipes/${newId}`);
+    } finally {
+      setIsForking(false);
+    }
+  }
+
+  if (loadingRecipe) {
+    return (
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: 24 }}>
+        <Link to="/recipes">← Back</Link>
+        <p style={{ marginTop: 12, opacity: 0.8 }}>Loading…</p>
+      </div>
+    );
   }
 
   if (!recipe) {
@@ -76,13 +207,12 @@ export default function RecipeDetail() {
         )}
 
         <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-          {recipe.visibility.toUpperCase()} • {recipe.servingsDefault} servings
+          {servingsLabel}
           {recipe.authorName ? ` • by ${recipe.authorName}` : ""}
           {isFork ? " • FORK" : ""}
           {recipe.rootId ? ` • root: ${recipe.rootId}` : ""}
         </div>
 
-        {/* Fork lineage panel */}
         {recipe.parentId && (
           <div
             style={{
@@ -114,12 +244,7 @@ export default function RecipeDetail() {
         )}
 
         <div
-          style={{
-            marginTop: 14,
-            display: "flex",
-            gap: 10,
-            flexWrap: "wrap",
-          }}
+          style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}
         >
           <Link
             to={`/recipes/${recipe.id}/make`}
@@ -134,6 +259,21 @@ export default function RecipeDetail() {
           </Link>
 
           <button
+            onClick={toggleSave}
+            disabled={saving}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid #444",
+              cursor: saving ? "not-allowed" : "pointer",
+              opacity: saving ? 0.6 : 1,
+            }}
+            title={user ? "" : "Sign in to save recipes"}
+          >
+            {isSaved ? "★ Saved" : "☆ Save to Recipe Book"}
+          </button>
+
+          <button
             onClick={openFork}
             disabled={isForking}
             style={{
@@ -143,19 +283,24 @@ export default function RecipeDetail() {
               cursor: isForking ? "not-allowed" : "pointer",
               opacity: isForking ? 0.6 : 1,
             }}
+            title={user ? "" : "Sign in to fork recipes"}
           >
             🍴 Fork this recipe
           </button>
+
+          {!user && !authLoading && (
+            <div style={{ fontSize: 12, opacity: 0.75, alignSelf: "center" }}>
+              Want to save/fork?{" "}
+              <button onClick={goToLogin} style={{ cursor: "pointer" }}>
+                Sign in
+              </button>
+            </div>
+          )}
         </div>
 
         {recipe.tags?.length > 0 && (
           <div
-            style={{
-              marginTop: 12,
-              display: "flex",
-              gap: 6,
-              flexWrap: "wrap",
-            }}
+            style={{ marginTop: 12, display: "flex", gap: 6, flexWrap: "wrap" }}
           >
             {recipe.tags.map((t) => (
               <span
@@ -175,7 +320,6 @@ export default function RecipeDetail() {
         )}
       </div>
 
-      {/* Ingredients */}
       <div style={{ marginTop: 18 }}>
         <h2 style={{ marginBottom: 8 }}>Ingredients</h2>
         <div style={{ display: "grid", gap: 8 }}>
@@ -200,7 +344,6 @@ export default function RecipeDetail() {
         </div>
       </div>
 
-      {/* Steps */}
       <div style={{ marginTop: 18 }}>
         <h2 style={{ marginBottom: 8 }}>Steps</h2>
         <div style={{ display: "grid", gap: 10 }}>
@@ -227,7 +370,6 @@ export default function RecipeDetail() {
         </div>
       </div>
 
-      {/* Fork Modal */}
       {forkOpen && (
         <div
           role="dialog"
@@ -370,11 +512,7 @@ export default function RecipeDetail() {
               </div>
 
               <div
-                style={{
-                  display: "flex",
-                  justifyContent: "flex-end",
-                  gap: 10,
-                }}
+                style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}
               >
                 <button
                   onClick={() => setForkOpen(false)}

@@ -24,6 +24,9 @@ export type Recipe = {
   description?: string;
   authorName?: string;
 
+  // NEW: set on Firestore-backed recipes
+  ownerId?: string;
+
   visibility: RecipeVisibility;
 
   // Fork / lineage
